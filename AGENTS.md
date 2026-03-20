@@ -59,3 +59,8 @@ git checkout main
 git merge agent/kernel-dev --no-ff -m "review: approve frame allocator by kernel-dev"
 git push origin main
 ```
+
+## Build Notes
+- Always use nightly Rust (rust-toolchain.toml handles this)
+- During early development, add `#[allow(dead_code)]` to new modules
+- The project requires Rust nightly due to bare-metal OS features
