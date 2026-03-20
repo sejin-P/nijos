@@ -29,6 +29,7 @@ _start() {
 ```
 
 **Dependency order:**
+- Serial UART ← none (debugging output, works before VGA)
 - VGA ← none (can use immediately)
 - GDT ← none (required for proper segmentation)
 - IDT ← GDT (needs code segment selector)
@@ -36,11 +37,53 @@ _start() {
 - Paging ← frame allocator
 - Heap ← paging + frame allocator
 
+**Panic handler:**
+```rust
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    println!("{}", info);  // VGA output
+    serial_println!("{}", info);  // Serial for logging
+    loop { x86_64::instructions::hlt(); }
+}
+```
+
 ---
 
-## 2. Memory Management Strategy
+## 2. Memory Layout
 
-### 2.1 Physical Frame Allocator (`src/kernel/memory/frame_allocator.rs`)
+### 2.0 Virtual Address Space Map
+
+```
+0x0000_0000_0000_0000 ┌─────────────────────────┐
+                      │ Null page (unmapped)    │
+0x0000_0000_0000_1000 ├─────────────────────────┤
+                      │ User space (future)     │
+                      │ ...                     │
+0x0000_7FFF_FFFF_FFFF ├─────────────────────────┤ ← Canonical address gap
+0xFFFF_8000_0000_0000 │ (non-canonical)         │
+                      │ CPU will #GP fault      │
+0xFFFF_FFFF_8000_0000 ├─────────────────────────┤
+                      │ Kernel code & data      │ ← Higher half (-2 GiB)
+0xFFFF_FFFF_C000_0000 ├─────────────────────────┤
+                      │ Physical mem offset map │ ← All physical RAM mapped here
+0x4444_4444_0000      ├─────────────────────────┤
+                      │ Heap (100 KiB initial)  │
+0x4444_4444_0000+100K ├─────────────────────────┤
+                      │ Stack (grows down)      │
+                      │ ...                     │
+0xFFFF_FFFF_FFFF_FFFF └─────────────────────────┘
+```
+
+**Key addresses:**
+- Kernel ELF loaded by bootloader at physical ~1 MiB, mapped to `-2 GiB` virtual
+- Physical memory offset mapping allows kernel to access all RAM
+- Heap at fixed virtual address (allocated on demand from frame allocator)
+
+---
+
+## 3. Memory Management Strategy
+
+### 3.1 Physical Frame Allocator (`src/kernel/memory/frame_allocator.rs`)
 
 **Purpose:** Manage 4 KiB physical frames (pages)
 
@@ -65,7 +108,7 @@ pub trait FrameAllocator {
 - Store bitmap in a static array (before heap is available)
 - Thread-safe via Mutex (after we have heap/sync primitives)
 
-### 2.2 Paging (`src/kernel/memory/paging.rs`)
+### 3.2 Paging (`src/kernel/memory/paging.rs`)
 
 **Purpose:** Virtual memory management via 4-level page tables
 
@@ -108,7 +151,7 @@ pub fn create_mapping(
 - `USER_ACCESSIBLE` - user mode can access (default kernel-only)
 - `NO_EXECUTE` - NX bit (security)
 
-### 2.3 Heap Allocator (`src/kernel/memory/heap.rs`)
+### 3.3 Heap Allocator (`src/kernel/memory/heap.rs`)
 
 **Purpose:** Dynamic memory allocation (`alloc::vec::Vec`, `Box`, etc.)
 
@@ -141,9 +184,9 @@ pub fn init_heap(mapper: &mut impl Mapper, frame_allocator: &mut impl FrameAlloc
 
 ---
 
-## 3. Interrupt Handling
+## 4. Interrupt Handling
 
-### 3.1 IDT Setup (`src/kernel/interrupts/idt.rs`)
+### 4.1 IDT Setup (`src/kernel/interrupts/idt.rs`)
 
 **Purpose:** Handle CPU exceptions and hardware interrupts
 
@@ -161,10 +204,17 @@ extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: Interrup
 ```
 
 **Double fault safety:**
-- Use separate IST (Interrupt Stack Table) entry
-- Allocate dedicated stack in `.bss` (avoid stack overflow loops)
+- Use separate IST (Interrupt Stack Table) entry 0
+- Allocate dedicated 4 KiB stack in `.bss`:
+  ```rust
+  #[repr(align(4096))]
+  struct Stack([u8; 4096]);
+  static mut DOUBLE_FAULT_STACK: Stack = Stack([0; 4096]);
+  ```
+- Critical: prevents stack overflow from causing triple fault
+- TSS IST[0] points to top of this stack
 
-### 3.2 PIC Configuration (`src/kernel/interrupts/pic.rs`)
+### 4.2 PIC Configuration (`src/kernel/interrupts/pic.rs`)
 
 **8259 PIC (Programmable Interrupt Controller):**
 - Remap IRQ 0-15 to IDT entries 32-47 (avoid conflict with CPU exceptions)
@@ -183,7 +233,7 @@ pub unsafe fn notify_end_of_interrupt(irq: u8);
 
 **Future:** Replace PIC with APIC (Advanced PIC) for multi-core support
 
-### 3.3 Timer Interrupt (`src/kernel/interrupts/timer.rs`)
+### 4.3 Timer Interrupt (`src/kernel/interrupts/timer.rs`)
 
 **Purpose:** Preemptive scheduling, uptime tracking
 
@@ -195,9 +245,57 @@ pub unsafe fn notify_end_of_interrupt(irq: u8);
 
 ---
 
-## 4. VGA Text Mode Driver
+## 5. Output Drivers
 
-### 4.1 Hardware Interface (`src/drivers/vga.rs`)
+### 5.1 Serial Port (UART) (`src/drivers/serial.rs`)
+
+**Purpose:** Debugging output via COM1 (0x3F8)
+
+**Why first:**
+- Works immediately (no VGA initialization complexity)
+- Output visible in QEMU via `-serial stdio`
+- Essential for debugging before VGA works
+
+**Implementation:**
+```rust
+use uart_16550::SerialPort;
+use spin::Mutex;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    pub static ref SERIAL1: Mutex<SerialPort> = {
+        let mut serial_port = unsafe { SerialPort::new(0x3F8) };
+        serial_port.init();
+        Mutex::new(serial_port)
+    };
+}
+
+#[macro_export]
+macro_rules! serial_print {
+    ($($arg:tt)*) => {
+        $crate::drivers::serial::_print(format_args!($($arg)*));
+    };
+}
+
+#[macro_export]
+macro_rules! serial_println {
+    () => ($crate::serial_print!("\n"));
+    ($fmt:expr) => ($crate::serial_print!(concat!($fmt, "\n")));
+    ($fmt:expr, $($arg:tt)*) => ($crate::serial_print!(concat!($fmt, "\n"), $($arg)*));
+}
+```
+
+**QEMU integration:**
+```bash
+qemu-system-x86_64 -drive format=raw,file=bootimage.bin -serial stdio
+# Serial output appears in terminal
+```
+
+---
+
+### 5.2 VGA Text Mode Driver
+
+#### 5.2.1 Hardware Interface (`src/drivers/vga.rs`)
 
 **VGA text buffer:**
 - Memory-mapped I/O at physical address `0xB8000`
@@ -253,7 +351,7 @@ macro_rules! println {
 }
 ```
 
-### 4.2 Scrolling & Newlines
+#### 5.2.2 Scrolling & Newlines
 
 **Behavior:**
 - When writing past column 79, wrap to next row
@@ -267,7 +365,7 @@ macro_rules! println {
 
 ---
 
-## 5. Module Boundaries
+## 6. Module Boundaries
 
 ```
 src/
@@ -291,13 +389,16 @@ src/
 │
 ├── drivers/
 │   ├── mod.rs                [driver-dev] Driver module root
+│   ├── serial.rs             [driver-dev] Serial port (UART) driver
 │   └── vga.rs                [driver-dev] VGA text buffer driver
 │
 └── hal/                      [driver-dev] (future: abstraction layer)
     └── mod.rs
 
 tests/
+├── should_panic.rs           [reviewer]   Panic handler tests
 ├── vga_buffer.rs             [reviewer]   VGA driver tests
+├── serial.rs                 [reviewer]   Serial driver tests
 ├── heap_allocation.rs        [reviewer]   Heap allocator tests
 └── frame_allocator.rs        [reviewer]   Frame allocator tests
 ```
@@ -310,20 +411,27 @@ tests/
 
 ---
 
-## 6. Implementation Order
+## 7. Implementation Order
 
 ### Phase 1: Boot & Display (Week 1)
 1. **Set up project structure** (architect)
-   - `Cargo.toml` with `bootloader` dependency
+   - `Cargo.toml` with `bootloader = "0.9"` dependency
    - `.cargo/config.toml` for x86_64 target
-   - Minimal `main.rs` with `_start`
+   - `rust-toolchain.toml` pinning nightly
+   - `x86_64-unknown-none.json` target specification
+   - Minimal `main.rs` with `_start` and panic handler
 
-2. **VGA text buffer driver** (driver-dev)
+2. **Serial port driver** (driver-dev)
+   - `src/drivers/serial.rs`
+   - `serial_print!` and `serial_println!` macros
+   - Test: Print "Serial: Kernel booted" visible in QEMU terminal
+
+3. **VGA text buffer driver** (driver-dev)
    - `src/drivers/vga.rs`
    - `print!` and `println!` macros
    - Test: Print "Hello from NijOS!" in `kernel_main()`
 
-3. **Testing harness** (reviewer)
+4. **Testing harness** (reviewer)
    - Set up `cargo test` with custom test runner
    - Write unit test for VGA scrolling
 
@@ -332,17 +440,17 @@ tests/
 ---
 
 ### Phase 2: Segmentation & Interrupts (Week 2)
-4. **GDT setup** (kernel-dev)
+5. **GDT setup** (kernel-dev)
    - `src/kernel/gdt.rs`
    - Load minimal 64-bit GDT
-   - Set up TSS with IST for double fault
+   - Set up TSS with IST entry 0 for double fault (4096-byte stack in `.bss`)
 
-5. **IDT & exception handling** (kernel-dev)
+6. **IDT & exception handling** (kernel-dev)
    - `src/kernel/interrupts/idt.rs`
    - Handlers for breakpoint, double fault, page fault
    - Test: Trigger `int3` breakpoint, verify handler runs
 
-6. **PIC & timer** (kernel-dev)
+7. **PIC & timer** (kernel-dev)
    - `src/kernel/interrupts/pic.rs`, `timer.rs`
    - Remap PIC, enable timer interrupt
    - Print tick count every second
@@ -352,18 +460,18 @@ tests/
 ---
 
 ### Phase 3: Memory Management (Week 3-4)
-7. **Physical frame allocator** (kernel-dev)
+8. **Physical frame allocator** (kernel-dev)
    - `src/kernel/memory/frame_allocator.rs`
    - Parse bootloader memory map
    - Bitmap-based allocator
 
-8. **Paging setup** (kernel-dev)
+9. **Paging setup** (kernel-dev)
    - `src/kernel/memory/paging.rs`
    - Create new page tables
    - Map kernel higher-half
    - Test: Map a new page, write to it
 
-9. **Heap allocator** (kernel-dev)
+10. **Heap allocator** (kernel-dev)
    - `src/kernel/memory/heap.rs`
    - Initialize fixed-size heap
    - Test: `Box::new()`, `Vec::push()`
@@ -373,13 +481,13 @@ tests/
 ---
 
 ### Phase 4: Stabilization & Testing (Week 5)
-10. **Comprehensive testing** (reviewer)
+11. **Comprehensive testing** (reviewer)
     - Unit tests for all allocators
     - Integration tests for interrupt handling
     - Run `cargo clippy -- -D warnings`
     - Memory leak detection (if possible)
 
-11. **Documentation** (all agents)
+12. **Documentation** (all agents)
     - Doc comments for all public APIs
     - Update this file with lessons learned
 
@@ -387,7 +495,43 @@ tests/
 
 ---
 
-## 7. Testing Strategy
+## 8. Error Handling Strategy
+
+### No Panicking in Kernel Code
+
+**Rule:** All fallible operations return `Result<T, E>`, never `panic!` in normal paths.
+
+**Error types:**
+```rust
+// Memory errors
+pub enum MemoryError {
+    FrameAllocationFailed,
+    InvalidAddress,
+    AlreadyMapped,
+    NotMapped,
+}
+
+// Use Result throughout
+pub fn allocate_frame() -> Result<PhysFrame, MemoryError>;
+pub fn map_page(...) -> Result<MapperFlush, MapToError>;
+```
+
+**When to panic:**
+- Unrecoverable initialization failures (e.g., no usable memory in bootloader map)
+- Assertion violations in debug builds (`debug_assert!`)
+- Explicit corruption detection (magic number mismatch, etc.)
+
+**Panic handler behavior:**
+1. Disable interrupts (`cli`)
+2. Print panic info to serial (always works)
+3. Print panic info to VGA (if initialized)
+4. Halt CPU in loop (`hlt`)
+
+**Future:** Add kernel debugger hooks before halt
+
+---
+
+## 9. Testing Strategy
 
 ### Unit Tests
 - **Frame allocator:** Allocate/deallocate patterns, bitmap edge cases
@@ -406,7 +550,7 @@ tests/
 
 ---
 
-## 8. Dependencies
+## 10. Dependencies & Build Configuration
 
 **Cargo.toml:**
 ```toml
@@ -424,12 +568,87 @@ version = "0.4"
 ```
 
 **Build toolchain:**
-- `rustup component add rust-src llvm-tools-preview`
-- `cargo install bootimage`
+```bash
+rustup component add rust-src llvm-tools-preview
+cargo install bootimage
+```
+
+**rust-toolchain.toml:**
+```toml
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "llvm-tools-preview"]
+```
+
+**x86_64-unknown-none.json** (custom target):
+```json
+{
+  "llvm-target": "x86_64-unknown-none",
+  "data-layout": "e-m:e-i64:64-f80:128-n8:16:32:64-S128",
+  "arch": "x86_64",
+  "target-endian": "little",
+  "target-pointer-width": "64",
+  "target-c-int-width": "32",
+  "os": "none",
+  "executables": true,
+  "linker-flavor": "ld.lld",
+  "linker": "rust-lld",
+  "panic-strategy": "abort",
+  "disable-redzone": true,
+  "features": "-mmx,-sse,+soft-float"
+}
+```
+
+**.cargo/config.toml:**
+```toml
+[build]
+target = "x86_64-unknown-none.json"
+
+[target.'cfg(target_os = "none")']
+runner = "bootimage runner"
+```
 
 ---
 
-## 9. Debugging & Troubleshooting
+## 11. Debugging & Troubleshooting
+
+### QEMU Debug Commands
+
+**Basic run:**
+```bash
+qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-nijos.bin
+```
+
+**With serial output:**
+```bash
+qemu-system-x86_64 \
+  -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-nijos.bin \
+  -serial stdio
+```
+
+**Full debugging (interrupts, CPU state):**
+```bash
+qemu-system-x86_64 \
+  -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-nijos.bin \
+  -serial stdio \
+  -d int,cpu_reset \
+  -no-reboot \
+  -no-shutdown
+```
+
+**GDB debugging:**
+```bash
+# Terminal 1:
+qemu-system-x86_64 -drive format=raw,file=bootimage.bin -s -S
+
+# Terminal 2:
+rust-gdb target/x86_64-unknown-none/debug/nijos
+(gdb) target remote :1234
+(gdb) break _start
+(gdb) continue
+```
+
+---
 
 ### Common Issues
 
@@ -455,7 +674,7 @@ version = "0.4"
 
 ---
 
-## 10. Future Work (Post-MVP)
+## 12. Future Work (Post-MVP)
 
 - **Keyboard driver:** PS/2 keyboard via IRQ 1
 - **APIC/APIC:** Replace PIC for SMP (multi-core) support
